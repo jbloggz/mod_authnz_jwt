@@ -1,6 +1,7 @@
 import time
 import unittest
 import json
+import requests
 from test_jwt import TestJWT
 
 
@@ -101,5 +102,36 @@ class TestLogin(TestJWT):
             self.assertEqual(c.name, "AuthToken")
             self.assertTrue(c.path, "/secure")
             self.assertTrue(c.has_nonstandard_attr('CustomAttr'))
+
+            self.assertToken(c.value, public_key, alg)
+
+    @TestJWT.with_all_algorithms(algorithms=("HS256",))
+    def test_login_should_success_with_user_exp_delay(self, alg, public_key, private_key, secured_url, login_url):
+        code, content, headers, cookies = self.http_post(login_url + "/user_exp_delay", {self.USERNAME_FIELD:self.USERNAME, self.PASSWORD_FIELD:self.PASSWORD})
+
+        self.assertEqual(code, 200)
+
+        received_object = json.loads(content)
+        self.assertTrue("token" in received_object)
+
+        jwt_fields = self.decode_jwt(received_object["token"], public_key, alg)
+        self.assertEqual(int(jwt_fields["exp"])-int(jwt_fields["iat"]), self.JWT_USER_EXPDELAY)
+
+    @TestJWT.with_all_algorithms()
+    def test_exp_refresh_should_success(self, alg, public_key, private_key, secured_url, login_url):
+        token = self.encode_jwt(
+            {"iss": self.JWT_ISS, "aud": self.JWT_AUD, "user": "test", "iat": int(time.time() - 1000), "nbf": int(time.time() - 1000),
+             "exp": int(time.time()) - 100}, private_key, alg)
+        r = requests.get(secured_url + "/exp_refresh", headers={"Cookie": "AuthToken=" + token})
+
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(r.cookies), 1)
+
+        # cookies.get("AuthToken") will return cookie.value not the cookie object
+        for c in r.cookies:
+            self.assertEqual(c.name, "AuthToken")
+            self.assertTrue(c.secure)
+            self.assertTrue(c.has_nonstandard_attr("HttpOnly"))
+            self.assertTrue(c.has_nonstandard_attr("SameSite"))
 
             self.assertToken(c.value, public_key, alg)
