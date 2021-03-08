@@ -1573,15 +1573,15 @@ static int token_check(request_rec *r, jwt_t **jwt, const char *token, const uns
 			char* username = (char *)token_get_claim(*jwt, attribute_username);
 			int refresh = get_config_exp_refresh(r, username);
 
-			if (exp + leeway < now + refresh){
-				/* Token can be refreshed */
-				ret = HTTP_RESET_CONTENT;
-			}
-			else {
+			if (exp + leeway + refresh < now){
 				apr_table_setn(r->err_headers_out, "WWW-Authenticate", apr_pstrcat(r->pool,
 				"Bearer realm=\"", ap_auth_name(r),"\", error=\"invalid_token\", error_description=\"Token expired\"",
 				NULL));
 				return HTTP_UNAUTHORIZED;
+			}
+			else {
+				/* Token can be refreshed */
+				ret = HTTP_RESET_CONTENT;
 			}
 		}
 	}
