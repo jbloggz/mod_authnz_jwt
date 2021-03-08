@@ -48,6 +48,7 @@
 #define MAX_KEY_LEN 16384
 
 #define DEFAULT_EXP_DELAY 1800
+#define DEFAULT_EXP_REFRESH 0
 #define DEFAULT_NBF_DELAY 0
 #define DEFAULT_LEEWAY 0
 
@@ -85,6 +86,10 @@ typedef struct {
 	int exp_delay;
 	int exp_delay_set;
    apr_hash_t *user_exp_delay;
+
+	int exp_refresh;
+	int exp_refresh_set;
+   apr_hash_t *user_exp_refresh;
 
 	int nbf_delay;
 	int nbf_delay_set;
@@ -154,9 +159,11 @@ static const char *add_authn_provider(cmd_parms * cmd, void *config, const char 
 static const char *set_jwt_param(cmd_parms * cmd, void* config, const char* value);
 static const char *set_jwt_int_param(cmd_parms * cmd, void* config, const char* value);
 static const char *set_jwt_exp_delay(cmd_parms * cmd, void* config, int argc, char *const argv[]);
+static const char *set_jwt_exp_refresh(cmd_parms * cmd, void* config, int argc, char *const argv[]);
 static const char* get_config_value(request_rec *r, jwt_directive directive);
 static const int get_config_int_value(request_rec *r, jwt_directive directive);
 static const int get_config_exp_delay(request_rec *r, const char *username);
+static const int get_config_exp_refresh(request_rec *r, const char *username);
 
 static const char *jwt_parse_config(cmd_parms *cmd, const char *require_line, const void **parsed_require_line);
 static authz_status jwtclaim_check_authorization(request_rec *r, const char* require_args, const void *parsed_require_args);
@@ -214,6 +221,8 @@ static const command_rec auth_jwt_cmds[] =
 					"The audience of delivered tokens"),
    AP_INIT_TAKE_ARGV("AuthJWTExpDelay", set_jwt_exp_delay, NULL, RSRC_CONF|OR_AUTHCFG,
 					"The time delay in seconds after which delivered tokens are considered invalid"),
+	AP_INIT_TAKE_ARGV("AuthJWTExpRefresh", set_jwt_exp_refresh, NULL, RSRC_CONF|OR_AUTHCFG,
+				"The time in seconds after a token has expired where a new token will be automatically issued. Only applies to tokens delivered by cookie. Can be restricted to one or more users by providing a list of names."),
    AP_INIT_TAKE1("AuthJWTNbfDelay", set_jwt_int_param, (void *)dir_nbf_delay, RSRC_CONF|OR_AUTHCFG,
 					"The time delay in seconds before which delivered tokens must not be processed"),
    AP_INIT_TAKE1("AuthJWTLeeway", set_jwt_int_param, (void *)dir_leeway, RSRC_CONF|OR_AUTHCFG,
@@ -250,6 +259,8 @@ static void *create_auth_jwt_dir_config(apr_pool_t *p, char *d){
 	conf->signature_private_key_file_set = 0;
 	conf->exp_delay_set = 0;
 	conf->user_exp_delay = NULL;
+	conf->exp_refresh_set = 0;
+	conf->user_exp_refresh = NULL;
 	conf->nbf_delay_set = 0;
 	conf->leeway_set = 0;
 	conf->iss_set = 0;
@@ -276,6 +287,8 @@ static void *create_auth_jwt_config(apr_pool_t * p, server_rec *s){
 	conf->signature_private_key_file_set = 0;
 	conf->exp_delay_set = 0;
 	conf->user_exp_delay = NULL;
+	conf->exp_refresh_set = 0;
+	conf->user_exp_refresh = NULL;
 	conf->nbf_delay_set = 0;
 	conf->leeway_set = 0;
 	conf->iss_set = 0;
@@ -310,6 +323,9 @@ static void* merge_auth_jwt_dir_config(apr_pool_t *p, void* basev, void* addv){
 	new->exp_delay = (add->exp_delay_set == 0) ? base->exp_delay : add->exp_delay;
 	new->exp_delay_set = base->exp_delay_set || add->exp_delay_set;
 	new->user_exp_delay = (add->user_exp_delay == NULL) ? base->user_exp_delay : add->user_exp_delay;
+	new->exp_refresh = (add->exp_refresh_set == 0) ? base->exp_refresh : add->exp_refresh;
+	new->exp_refresh_set = base->exp_refresh_set || add->exp_refresh_set;
+	new->user_exp_refresh = (add->user_exp_refresh == NULL) ? base->user_exp_refresh : add->user_exp_refresh;
 	new->nbf_delay = (add->nbf_delay_set == 0) ? base->nbf_delay : add->nbf_delay;
 	new->nbf_delay_set = base->nbf_delay_set || add->nbf_delay_set;
 	new->leeway = (add->leeway_set == 0) ? base->leeway : add->leeway;
@@ -548,6 +564,41 @@ static const int get_config_exp_delay(request_rec *r, const char *username){
 	}
 }
 
+static const int get_config_exp_refresh(request_rec *r, const char *username){
+	auth_jwt_config_rec *dconf = (auth_jwt_config_rec *) ap_get_module_config(r->per_dir_config, &auth_jwt_module);
+	auth_jwt_config_rec *sconf = (auth_jwt_config_rec *) ap_get_module_config(r->server->module_config, &auth_jwt_module);
+	int *value;
+
+	/*
+	 * Check in the following order:
+	 *  - dconf: user_exp_refresh
+	 *  - sconf: user_exp_refresh
+	 *  - dconf: exp_refresh
+	 *  - sconf: exp_refresh
+	 */
+	if (dconf->user_exp_refresh != NULL) {
+		value = apr_hash_get(dconf->user_exp_refresh, username, APR_HASH_KEY_STRING);
+		if (value) {
+			return *value;
+		}
+	}
+	else if (sconf->user_exp_refresh != NULL) {
+		value = apr_hash_get(sconf->user_exp_refresh, username, APR_HASH_KEY_STRING);
+		if (value) {
+			return *value;
+		}
+	}
+	else if (dconf->exp_refresh_set) {
+		return dconf->exp_refresh;
+	}
+	else if (sconf->exp_refresh_set) {
+		return sconf->exp_refresh;
+	}
+	else {
+		return DEFAULT_EXP_REFRESH;
+	}
+}
+
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~  REGISTER HOOKS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~  */
 
 static void register_hooks(apr_pool_t * p){
@@ -744,6 +795,49 @@ static const char *set_jwt_exp_delay(cmd_parms * cmd, void* config, int argc, ch
 	*delay = atoi(argv[argc-1]);
 	for (i = 0; i < argc-1; i++) {
 		apr_hash_set(conf->user_exp_delay, apr_pstrdup(cmd->pool, argv[i]), APR_HASH_KEY_STRING, delay);
+	}
+
+	return NULL;
+}
+
+
+static const char *set_jwt_exp_refresh(cmd_parms * cmd, void* config, int argc, char *const argv[]){
+
+	auth_jwt_config_rec *conf;
+	int i;
+	int *refresh;
+
+	if (!cmd->path){
+		conf = (auth_jwt_config_rec *) ap_get_module_config(cmd->server->module_config, &auth_jwt_module);
+	} else {
+		conf = (auth_jwt_config_rec *) config;
+	}
+
+	if (argc == 0) {
+		return "AuthJWTExpRefresh must have at least 1 argument";
+	}
+
+	/* The final argument must be numeric */
+	if (!is_numeric(argv[argc-1])) {
+		return "AuthJWTExpRefresh value must be numeric!";
+	}
+
+	if (argc == 1) {
+		/* No users provided */
+		conf->exp_refresh = atoi(argv[argc-1]);
+		conf->exp_refresh_set = 1;
+		return NULL;
+	}
+
+	/* Users provided */
+	if (conf->user_exp_refresh == NULL) {
+		conf->user_exp_refresh = apr_hash_make(cmd->pool);
+	}
+
+	refresh = apr_palloc(cmd->pool, sizeof(int));
+	*refresh = atoi(argv[argc-1]);
+	for (i = 0; i < argc-1; i++) {
+		apr_hash_set(conf->user_exp_refresh, apr_pstrdup(cmd->pool, argv[i]), APR_HASH_KEY_STRING, refresh);
 	}
 
 	return NULL;
@@ -1125,6 +1219,7 @@ static int auth_jwt_authn_with_token(request_rec *r){
 	const char *current_auth = NULL;
 	current_auth = ap_auth_type(r);
 	int rv;
+	int cookie_used = 0;
 
 	if (!current_auth || strncmp(current_auth, "jwt", 3) != 0) {
 		return DECLINED;
@@ -1197,6 +1292,8 @@ static int auth_jwt_authn_with_token(request_rec *r){
 			logCode = APLOGNO(55409);
 			logStr = "auth_jwt authn: missing authorization cookie";
 		}
+
+		cookie_used = 1;
 	}
 
 	if(!token_str) {
@@ -1220,6 +1317,38 @@ static int auth_jwt_authn_with_token(request_rec *r){
 	ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(55405)
 						"auth_jwt authn: checking signature and fields correctness...");
 	rv = token_check(r, &token, token_str, key, keylen);
+
+	if(HTTP_RESET_CONTENT == rv) {
+		/* Only generate a new token if the request used a cookie */
+		if(cookie_used){
+			/* Create a new token for the user */
+			ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(55410) "Request within refresh interval. Creating new token");
+			char* new_token = NULL;
+			const char* attribute_username = (const char*)get_config_value(r, dir_attribute_username);
+			char* username = (char *)token_get_claim(token, attribute_username);
+			if(create_token(r, &new_token, username) == OK){
+				char* cookie_name = (char *)get_config_value(r, dir_cookie_name);
+				char* cookie_attr = (char *)get_config_value(r, dir_cookie_attr);
+				ap_cookie_write(r, cookie_name, new_token, cookie_attr, 0, r->headers_out, NULL);
+				rv = OK;
+			}
+			free(new_token);
+		}
+
+		if (rv != OK) {
+			if(cookie_used){
+				ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(55411) "An error occured while creating a new token");
+			}
+			else{
+				ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(55412) "Refresh token cannot be created for bearer authentication");
+			}
+			/* New cookie couldn't be created, so just pretend the old cookie failed to authenticate */
+			apr_table_setn(r->err_headers_out, "WWW-Authenticate", apr_pstrcat(r->pool,
+			"Bearer realm=\"", ap_auth_name(r),"\", error=\"invalid_token\", error_description=\"Token expired\"",
+			NULL));
+			return HTTP_UNAUTHORIZED;
+		}
+	}
 
 	if(OK == rv){
 		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(55406)
@@ -1363,6 +1492,7 @@ static int token_new(jwt_t **jwt){
 static int token_check(request_rec *r, jwt_t **jwt, const char *token, const unsigned char *key, unsigned int keylen){
 
 	int decode_res = token_decode(jwt, token, key, keylen);
+	int ret = OK;
 
 	if(decode_res != 0){
 		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(55512)"Decoding process has failed, token is either malformed or signature is invalid");
@@ -1412,10 +1542,21 @@ static int token_check(request_rec *r, jwt_t **jwt, const char *token, const uns
 		if (exp + leeway < now){
 			/* token expired */
 			ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(55516)"Token expired");
-			apr_table_setn(r->err_headers_out, "WWW-Authenticate", apr_pstrcat(r->pool,
-			"Bearer realm=\"", ap_auth_name(r),"\", error=\"invalid_token\", error_description=\"Token expired\"",
-			NULL));
-			return HTTP_UNAUTHORIZED;
+
+			const char* attribute_username = (const char*)get_config_value(r, dir_attribute_username);
+			char* username = (char *)token_get_claim(*jwt, attribute_username);
+			int refresh = get_config_exp_refresh(r, username);
+
+			if (exp + leeway + refresh < now){
+				apr_table_setn(r->err_headers_out, "WWW-Authenticate", apr_pstrcat(r->pool,
+				"Bearer realm=\"", ap_auth_name(r),"\", error=\"invalid_token\", error_description=\"Token expired\"",
+				NULL));
+				return HTTP_UNAUTHORIZED;
+			}
+			else {
+				/* Token can be refreshed */
+				ret = HTTP_RESET_CONTENT;
+			}
 		}
 	}
 
@@ -1443,7 +1584,7 @@ static int token_check(request_rec *r, jwt_t **jwt, const char *token, const uns
 		NULL));
 		return HTTP_UNAUTHORIZED;
 	}
-	return 	OK;
+	return ret;
 }
 
 static int token_decode(jwt_t **jwt, const char* token, const unsigned char *key, unsigned int keylen){
